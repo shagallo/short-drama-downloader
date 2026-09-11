@@ -23,6 +23,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlsplit, parse_qsl
 
 import requests
+from platform_support import data_dir, resource_dir
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 
@@ -88,8 +89,8 @@ def load_local_config() -> Dict[str, Any]:
 def get_device_keys() -> Dict[str, str]:
     """Return device credentials from env vars or local config.json.
 
-    ?????????? device_id / install_id??????????
-    ?? EXE ??????????????????? config.json?
+    优先使用环境变量中的 device_id / install_id；未设置时读取
+    EXE 或脚本运行目录下的 config.json。
     """
     config = load_local_config()
 
@@ -184,10 +185,8 @@ def get_current_domain(request=None) -> str:
 
 
 def get_runtime_base_dir() -> Path:
-    """Return the directory of the running exe or script."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    """Writable data directory, never the inside of a macOS application bundle."""
+    return data_dir()
 
 
 DEFAULT_TIMEOUT = 30
@@ -198,16 +197,34 @@ VIDEO_TTL_SECONDS = 300
 
 def get_ffmpeg_binary() -> str:
     """Resolve ffmpeg for source checkout and PyInstaller onedir runs."""
-    runtime_dir = get_runtime_base_dir()
+    runtime_dir = resource_dir()
+    explicit = os.getenv("FFMPEG_BIN", "").strip()
+    if explicit:
+        return str(Path(explicit).expanduser())
     candidates = [
-        runtime_dir / "ffmpeg.exe",
-        runtime_dir / "??" / "ffmpeg.exe",
-        Path(getattr(sys, "_MEIPASS", runtime_dir)) / "ffmpeg.exe",
-        Path(getattr(sys, "_MEIPASS", runtime_dir)) / "??" / "ffmpeg.exe",
+        runtime_dir / "ffmpeg",
+        runtime_dir / "插件" / "ffmpeg",
+        Path(getattr(sys, "_MEIPASS", runtime_dir)) / "ffmpeg",
+        Path(getattr(sys, "_MEIPASS", runtime_dir)) / "插件" / "ffmpeg",
     ]
+    if os.name == "nt":
+        candidates = [
+            runtime_dir / "ffmpeg.exe",
+            runtime_dir / "插件" / "ffmpeg.exe",
+            Path(getattr(sys, "_MEIPASS", runtime_dir)) / "ffmpeg.exe",
+            Path(getattr(sys, "_MEIPASS", runtime_dir)) / "插件" / "ffmpeg.exe",
+        ] + candidates
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
+    try:
+        # pip 依赖 imageio-ffmpeg 自带各平台静态 ffmpeg（macOS 的主要获取途径）
+        import imageio_ffmpeg
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).exists():
+            return bundled
+    except Exception:
+        pass
     return os.getenv("FFMPEG_BIN", FFMPEG_BIN)
 
 
@@ -485,6 +502,8 @@ def download_and_decrypt_video(
                                     except Exception:
                                         pass
 
+                                if not real_main_url.startswith(("http://", "https://")):
+                                    raise RuntimeError("视频地址解密后不是可下载链接")
                                 try:
                                     future = VIDEO_WORKER_POOL.submit(
                                         download_decrypt_and_serve,
@@ -493,10 +512,11 @@ def download_and_decrypt_video(
                                         content_key,
                                     )
                                     local_url = future.result()
-                                    if local_url:
-                                        best_item["main_url"] = local_url
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    raise RuntimeError(f"本地视频处理失败：{exc}") from exc
+                                if not local_url:
+                                    raise RuntimeError("本地视频处理没有生成文件")
+                                best_item["main_url"] = local_url
 
                             # only keep best quality
                             video_data["video_list"] = {best_key: best_item}
@@ -525,6 +545,18 @@ def download_and_decrypt_video(
     )
 
 
+def hidden_subprocess_kwargs() -> Dict[str, Any]:
+    """Hide the console window when spawning ffmpeg from the windowed build."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+
+
 def download_decrypt_and_serve(
     request,
     video_url: str,
@@ -543,21 +575,49 @@ def stream_copy_video_with_ffmpeg(
     video_url: str,
     content_key: Optional[bytes],
 ) -> str:
-    """Let ffmpeg pull the remote MP4 directly and write a local playable file."""
+    """Download with requests, then let ffmpeg process the local encrypted MP4."""
     stream_start = time.perf_counter()
     src_dir = get_runtime_base_dir() / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"video_{time.time_ns()}.mp4"
+    unique_id = time.time_ns()
+    filename = f"video_{unique_id}.mp4"
     filepath = src_dir / filename
+    encrypted_path = src_dir / f".encrypted_{unique_id}.mp4"
+
+    try:
+        with requests.get(
+            video_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": "https://novel.snssdk.com/",
+            },
+            stream=True,
+            timeout=(30, 120),
+        ) as response:
+            response.raise_for_status()
+            with encrypted_path.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+        if not encrypted_path.exists() or encrypted_path.stat().st_size == 0:
+            raise RuntimeError("视频源返回了空文件")
+    except Exception as exc:
+        encrypted_path.unlink(missing_ok=True)
+        raise Exception(f"视频流下载失败：{exc}") from exc
 
     ffmpeg_bin = get_ffmpeg_binary()
-    command = [ffmpeg_bin, "-y"]
+    command = [
+        ffmpeg_bin,
+        "-y",
+        "-loglevel",
+        "error",
+    ]
     if content_key:
         command.extend(["-decryption_key", content_key.hex()])
     command.extend([
         "-i",
-        video_url,
+        str(encrypted_path),
         "-c",
         "copy",
         "-movflags",
@@ -566,14 +626,24 @@ def stream_copy_video_with_ffmpeg(
     ])
 
     try:
-        subprocess.run(
+        completed = subprocess.run(
             command,
-            check=True,
+            check=False,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hidden_subprocess_kwargs(),
         )
-    except subprocess.CalledProcessError as exc:
-        raise Exception(f"Failed to stream video with ffmpeg: {exc}")
+    finally:
+        encrypted_path.unlink(missing_ok=True)
+    if completed.returncode != 0:
+        filepath.unlink(missing_ok=True)
+        details = (completed.stderr or "未知错误").strip()
+        details = re.sub(r"https?://\S+", "[video-url]", details)
+        details = details[-800:]
+        raise Exception(f"FFmpeg 处理失败（代码 {completed.returncode}）：{details}")
 
     stream_seconds = time.perf_counter() - stream_start
     print(f"[timing] stream_copy_seconds={stream_seconds:.3f}")

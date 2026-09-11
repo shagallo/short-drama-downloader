@@ -1,4 +1,4 @@
-﻿"""
+"""
 短剧下载工具 · 开源版
 
 启动：python app.py
@@ -10,9 +10,11 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import webbrowser
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
@@ -20,6 +22,11 @@ from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory
+
+from download_manager import DownloadManager
+from platform_support import (validate_download_path, resolve_download_dir,
+                              ensure_writable_directory, default_download_dir)
+from werkzeug.serving import make_server
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -31,6 +38,9 @@ HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
 }
 ITEMS_PER_PAGE = 50
+HONGGUO_BASE_URL = "https://hongguoduanju.com"
+HONGGUO_CATEGORY_API = f"{HONGGUO_BASE_URL}/api/category/page"
+HONGGUO_SUGGESTION_API = f"{HONGGUO_BASE_URL}/incent_resource/suggestion"
 
 
 SOURCE_ALIASES = {
@@ -156,17 +166,106 @@ def read_local_config() -> dict:
         return {}
 
 
-@app.route("/api/config", methods=["GET"])
+def write_local_config(data: dict) -> Path:
+    path = get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_path, path)
+    return path
+
+
+def get_effective_config() -> dict:
+    """Return the credentials the downloader will actually use."""
+    cfg = read_local_config()
+    return {
+        **cfg,
+        "device_id": str(os.getenv("DUANJU_DEVICE_ID") or cfg.get("device_id") or "").strip(),
+        "install_id": str(os.getenv("DUANJU_INSTALL_ID") or cfg.get("install_id") or "").strip(),
+        "platform": str(os.getenv("DUANJU_PLATFORM") or cfg.get("platform") or "android").strip() or "android",
+    }
+
+
+DEVICE_CONFIG_LOCK = threading.Lock()
+
+
+def generate_device_config() -> dict:
+    """Generate a fresh credential pair using the project's registration tool."""
+    with DEVICE_CONFIG_LOCK:
+        if os.getenv("DUANJU_DEVICE_ID") or os.getenv("DUANJU_INSTALL_ID"):
+            raise RuntimeError("当前配置由环境变量控制，请先移除环境变量后再生成")
+        registrar = importlib.import_module("device_register")
+        generated = registrar.device_register()
+        device_id = str(generated.get("device_id") or "").strip()
+        install_id = str(generated.get("install_id") or "").strip()
+        if not device_id or not install_id:
+            raise RuntimeError("设备注册工具没有返回完整参数")
+        cfg = read_local_config()
+        cfg.update({
+            "device_id": device_id,
+            "install_id": install_id,
+            "platform": str(generated.get("platform") or "android"),
+            "device_config_source": "generated",
+        })
+        write_local_config(cfg)
+        download_manager.notify_config_changed(retry_failed=True)
+        return {
+            "device_id_masked": mask_value(device_id),
+            "install_id_masked": mask_value(install_id),
+            "platform": cfg["platform"],
+            "activation_warning": str(generated.get("activation_warning") or ""),
+        }
+
+
+def ensure_default_device_config() -> bool:
+    """Create a default generated pair when no usable configuration exists."""
+    effective = get_effective_config()
+    if effective.get("device_id") and effective.get("install_id"):
+        return False
+    generate_device_config()
+    return True
+
+
+download_manager = DownloadManager(
+    runtime_dir=parser_module.get_runtime_base_dir(),
+    downloader=handle_video_request,
+    config_getter=get_effective_config,
+)
+
+
+@app.route("/api/config", methods=["GET", "DELETE"])
 def get_config():
     cfg = read_local_config()
-    device_id = os.getenv("DUANJU_DEVICE_ID") or str(cfg.get("device_id", ""))
-    install_id = os.getenv("DUANJU_INSTALL_ID") or str(cfg.get("install_id", ""))
+    env_device_id = str(os.getenv("DUANJU_DEVICE_ID") or "").strip()
+    env_install_id = str(os.getenv("DUANJU_INSTALL_ID") or "").strip()
+    device_id = env_device_id or str(cfg.get("device_id", ""))
+    install_id = env_install_id or str(cfg.get("install_id", ""))
     platform = os.getenv("DUANJU_PLATFORM") or str(cfg.get("platform", "android"))
+
+    if request.method == "DELETE":
+        for key in ("device_id", "install_id", "platform", "device_config_source"):
+            cfg.pop(key, None)
+        write_local_config(cfg)
+        download_manager.notify_config_changed()
+        return jsonify({
+            "ok": True,
+            "configured": bool(env_device_id and env_install_id),
+            "environment_override": bool(env_device_id or env_install_id),
+        })
+
     return jsonify({
         "configured": bool(device_id and install_id),
+        "device_id": device_id,
+        "install_id": install_id,
         "device_id_masked": mask_value(device_id),
         "install_id_masked": mask_value(install_id),
         "platform": platform or "android",
+        "source": (
+            "environment"
+            if env_device_id or env_install_id
+            else (str(cfg.get("device_config_source") or "local") if device_id or install_id else "none")
+        ),
+        "environment_override": bool(env_device_id or env_install_id),
         "config_path": str(get_config_path()),
     })
 
@@ -180,13 +279,152 @@ def save_config():
 
     if not device_id or not install_id:
         return jsonify({"error": "device_id and install_id are required"}), 400
+    if platform not in {"android", "ios"}:
+        return jsonify({"error": "platform must be android or ios"}), 400
 
-    path = get_config_path()
-    path.write_text(
-        json.dumps({"device_id": device_id, "install_id": install_id, "platform": platform}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    cfg = read_local_config()
+    cfg.update({
+        "device_id": device_id,
+        "install_id": install_id,
+        "platform": platform,
+        "device_config_source": "manual",
+    })
+    path = write_local_config(cfg)
+    download_manager.notify_config_changed(retry_failed=True)
     return jsonify({"ok": True, "config_path": str(path)})
+
+
+@app.route("/api/config/generate", methods=["POST"])
+def generate_config_api():
+    try:
+        generated = generate_device_config()
+        return jsonify({"ok": True, **generated})
+    except Exception as exc:
+        return jsonify({"error": f"生成设备配置失败：{exc}"}), 502
+
+
+@app.route("/api/download-settings", methods=["GET", "POST"])
+def download_settings():
+    if request.method == "GET":
+        raw = str(read_local_config().get("download_dir") or "").strip()
+        path, notice = resolve_download_dir(raw, download_manager.runtime_dir)
+        try:
+            ensure_writable_directory(path)
+            writable, error = True, ""
+        except OSError as exc:
+            writable, error = False, f"目录不可写，请选择其他目录或允许文件夹访问：{exc}"
+        return jsonify({"download_dir": str(path), "exists": path.is_dir(),
+                        "writable": writable, "notice": notice, "error_message": error,
+                        "default_download_dir": str(default_download_dir(download_manager.runtime_dir))})
+
+    payload = request.get_json(silent=True) or {}
+    raw_path = str(payload.get("download_dir") or "").strip()
+    if not raw_path:
+        return jsonify({"error": "下载目录不能为空"}), 400
+    try:
+        path = validate_download_path(raw_path)
+        ensure_writable_directory(path)
+        cfg = read_local_config()
+        cfg["download_dir"] = str(path)
+        write_local_config(cfg)
+        return jsonify({"ok": True, "download_dir": str(path)})
+    except Exception as exc:
+        return jsonify({"error": f"无法使用该下载目录：{exc}"}), 400
+
+
+def open_local_folder(path: Path) -> None:
+    path = path.resolve()
+    ensure_writable_directory(path)
+    if not path.is_dir():
+        raise NotADirectoryError(f"不是有效目录：{path}")
+    if os.name == "nt":
+        # os.startfile can return WinError 5 when Flask is launched from a
+        # restricted parent process. Calling Explorer directly also reuses an
+        # existing Explorer session and works in that environment.
+        subprocess.Popen(["explorer.exe", "/n,", str(path)])
+    elif sys.platform == "darwin":
+        result = subprocess.run(["/usr/bin/open", str(path)], capture_output=True,
+                                text=True, timeout=10)
+        if result.returncode:
+            raise OSError(result.stderr.strip() or "Finder 无法打开目录")
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+@app.route("/api/download-folder/open", methods=["POST"])
+def open_download_folder():
+    try:
+        path = download_manager.download_dir()
+        open_local_folder(path)
+        return jsonify({"ok": True, "path": str(path)})
+    except Exception as exc:
+        return jsonify({"error": f"无法打开下载目录：{exc}"}), 500
+
+
+@app.route("/api/downloads", methods=["GET", "POST", "DELETE"])
+def downloads():
+    if request.method == "GET":
+        return jsonify(download_manager.snapshot())
+    if request.method == "DELETE":
+        scope = str(request.args.get("scope") or "completed")
+        if scope not in {"completed", "failed", "all"}:
+            return jsonify({"error": "不支持的清理范围"}), 400
+        removed = download_manager.clear(scope)
+        return jsonify({"ok": True, "removed": removed})
+
+    try:
+        task = download_manager.add_task(request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "task": task}), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/downloads/control", methods=["POST"])
+def control_downloads():
+    action = str((request.get_json(silent=True) or {}).get("action") or "").strip()
+    if action == "pause":
+        download_manager.pause_all()
+    elif action == "resume":
+        download_manager.resume_all()
+    else:
+        return jsonify({"error": "操作必须是 pause 或 resume"}), 400
+    return jsonify({"ok": True, **download_manager.snapshot()})
+
+
+@app.route("/api/downloads/<task_id>", methods=["DELETE"])
+def delete_download(task_id: str):
+    try:
+        removed = download_manager.delete(task_id)
+        return jsonify({"ok": True, "task": removed})
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.route("/api/downloads/<task_id>/retry", methods=["POST"])
+def retry_download(task_id: str):
+    try:
+        task = download_manager.retry(task_id)
+        return jsonify({"ok": True, "task": task})
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/downloads/<task_id>/open", methods=["POST"])
+def open_task_folder(task_id: str):
+    task = next(
+        (item for item in download_manager.snapshot()["tasks"] if item.get("id") == task_id),
+        None,
+    )
+    if not task:
+        return jsonify({"error": "下载任务不存在"}), 404
+    try:
+        path = Path(task.get("folder_path") or download_manager.download_dir())
+        open_local_folder(path)
+        return jsonify({"ok": True, "path": str(path.resolve())})
+    except Exception as exc:
+        return jsonify({"error": f"无法打开任务目录：{exc}"}), 500
 
 
 # ───────────────────────── 搜索源 ─────────────────────────
@@ -213,8 +451,19 @@ def fetch_text(url: str, timeout: int = 20) -> str:
     resp = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
     resp.raise_for_status()
     if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
-        resp.encoding = resp.apparent_encoding or "utf-8"
+        resp.encoding = "utf-8"
     return resp.text
+
+
+def fetch_json(url: str, params: dict | None = None, timeout: int = 20) -> dict:
+    headers = dict(HTTP_HEADERS)
+    headers["Referer"] = f"{HONGGUO_BASE_URL}/category"
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected JSON response")
+    return payload
 
 
 def dedupe_items(items: list[dict]) -> list[dict]:
@@ -255,7 +504,7 @@ def first_category_query(keyword: str, category_filter: str) -> str:
     return "sort_type=1"
 
 
-def parse_hongguo_cards(html_text: str, base_url: str = "https://hongguoduanju.com") -> list[dict]:
+def parse_hongguo_cards(html_text: str, base_url: str = HONGGUO_BASE_URL) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     items = []
     for a in soup.select('a[href*="/detail?series_id="]'):
@@ -305,22 +554,242 @@ def parse_hongguo_cards(html_text: str, base_url: str = "https://hongguoduanju.c
     return dedupe_items(items)
 
 
+def build_hongguo_api_params(keyword: str, page: int, category_filter: str) -> dict:
+    selected = parse_qs(first_category_query(keyword, category_filter))
+    params: dict[str, Any] = {
+        "page_num": max(int(page or 1), 1),
+        "sort_type": (selected.get("sort_type") or ["1"])[0],
+    }
+
+    for key in ("background", "topic", "setting"):
+        value = (selected.get(key) or [""])[0]
+        if value:
+            params["categories_v2"] = value
+            break
+
+    gender = (selected.get("gender") or [""])[0]
+    if gender:
+        params["gender"] = gender
+    return params
+
+
+def parse_hongguo_api_items(payload: dict) -> list[dict]:
+    raw_items = payload.get("recommendList") or []
+    if not isinstance(raw_items, list):
+        return []
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        series_id = clean_text(raw.get("series_id"))
+        title = clean_text(raw.get("series_name"))
+        if not series_id or not title:
+            continue
+
+        episode_count = raw.get("episode_cnt") or ""
+        episode_text = clean_text(raw.get("episode_right_text"))
+        if not episode_text and episode_count:
+            episode_text = f"\u5168{episode_count}\u96c6"
+
+        tags = raw.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+        tag_texts = [clean_text(tag) for tag in tags if clean_text(tag)]
+
+        episode_ids = raw.get("vid_list") or []
+        if not isinstance(episode_ids, list):
+            episode_ids = []
+        episode_ids = [clean_text(vid) for vid in episode_ids if clean_text(vid)]
+
+        celebrities = raw.get("celebrities") or []
+        actor_names = []
+        if isinstance(celebrities, list):
+            actor_names = [
+                clean_text(actor.get("nickname"))
+                for actor in celebrities
+                if isinstance(actor, dict) and clean_text(actor.get("nickname"))
+            ][:3]
+
+        items.append({
+            "author": " / ".join(actor_names) or "\u7ea2\u679c\u77ed\u5267",
+            "title": title,
+            "drama_id": series_id,
+            "episodes": episode_text,
+            "duration": estimate_duration_from_episodes(episode_text),
+            "online_time": public_unknown_time(),
+            "category": " / ".join(tag_texts),
+            "source": "\u7ea2\u679c\u77ed\u5267\u5b98\u7f51",
+            "source_url": f"{HONGGUO_BASE_URL}/detail?series_id={series_id}",
+            "cover_url": clean_text(raw.get("series_cover")),
+            "episode_ids": episode_ids,
+            "downloadable": True,
+            "desc": clean_text(raw.get("series_intro")),
+            "duration_source": "estimated_from_episode_count" if episode_text else "not_public",
+            "online_time_source": "not_public",
+        })
+    return dedupe_items(items)
+
+
+def find_series_detail(value: Any, series_id: str) -> dict | None:
+    if isinstance(value, dict):
+        if clean_text(value.get("series_id")) == series_id and isinstance(value.get("vid_list"), list):
+            return value
+        for child in value.values():
+            found = find_series_detail(child, series_id)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_series_detail(child, series_id)
+            if found:
+                return found
+    return None
+
+
+@lru_cache(maxsize=128)
+def fetch_hongguo_series_item(series_id: str) -> dict:
+    """Read the complete episode extract from the official detail page router data."""
+    series_id = clean_text(series_id)
+    if not series_id or not series_id.isdigit():
+        raise ValueError("短剧 ID 格式不正确")
+
+    html_text = fetch_text(f"{HONGGUO_BASE_URL}/detail?series_id={series_id}")
+    marker = "_ROUTER_DATA ="
+    marker_pos = html_text.find(marker)
+    if marker_pos < 0:
+        raise ValueError("官网详情页没有返回剧目信息")
+    json_start = html_text.find("{", marker_pos + len(marker))
+    if json_start < 0:
+        raise ValueError("官网详情数据格式异常")
+    router_data, _ = json.JSONDecoder().raw_decode(html_text[json_start:])
+    detail = find_series_detail(router_data, series_id)
+    if not detail:
+        raise ValueError("官网详情页没有找到该短剧")
+
+    items = parse_hongguo_api_items({"recommendList": [detail]})
+    if not items:
+        raise ValueError("无法解析短剧详情")
+    item = items[0]
+    item["source"] = "红果短剧官网详情"
+    return item
+
+
+def parse_hongguo_suggestion_items(payload: dict) -> list[dict]:
+    """Normalize the official keyword suggestion response into drama cards."""
+    raw_items = payload.get("suggest_list") or []
+    if not isinstance(raw_items, list):
+        return []
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict) or raw.get("word_type") not in {"title", "short_play_name"}:
+            continue
+        video = raw.get("video_data") if isinstance(raw.get("video_data"), dict) else {}
+        series_id = clean_text(video.get("series_id") or raw.get("keyword"))
+        if not series_id or not series_id.isdigit():
+            continue
+        title = clean_text(video.get("series_title") or video.get("series_name") or raw.get("name"))
+        if not title:
+            continue
+
+        episode_ids = video.get("vid_list") or []
+        if not isinstance(episode_ids, list):
+            episode_ids = []
+        episode_ids = [clean_text(vid) for vid in episode_ids if clean_text(vid)]
+        episode_count = video.get("episode_cnt") or ""
+        try:
+            episode_total = max(int(episode_count), 0)
+        except (TypeError, ValueError):
+            episode_total = 0
+        episode_text = clean_text(video.get("episode_right_text"))
+        if episode_total:
+            episode_text = f"全{episode_total}集"
+        if not episode_text and episode_ids:
+            episode_text = f"可选{len(episode_ids)}集"
+
+        categories = video.get("category_list") or []
+        category_names = [
+            clean_text(category.get("name"))
+            for category in categories
+            if isinstance(category, dict) and clean_text(category.get("name"))
+        ]
+        celebrities = video.get("celebrities") or []
+        actor_names = [
+            clean_text(actor.get("nickname") or actor.get("name"))
+            for actor in celebrities
+            if isinstance(actor, dict) and clean_text(actor.get("nickname") or actor.get("name"))
+        ][:3]
+
+        items.append({
+            "author": " / ".join(actor_names) or "红果短剧",
+            "title": title,
+            "drama_id": series_id,
+            "episodes": episode_text or "集数待加载",
+            "duration": estimate_duration_from_episodes(episode_text),
+            "online_time": public_unknown_time(),
+            "category": " / ".join(category_names) or "关键词搜索",
+            "source": "红果短剧官网搜索",
+            "source_url": f"{HONGGUO_BASE_URL}/detail?series_id={series_id}",
+            "cover_url": clean_text(video.get("series_cover")),
+            "episode_ids": episode_ids,
+            "downloadable": bool(episode_ids),
+            "desc": clean_text(video.get("series_intro")) or f"红果官网中与“{title}”相关的搜索结果。",
+            "duration_source": "estimated_from_episode_count" if episode_text else "not_public",
+            "online_time_source": "not_public",
+        })
+    return dedupe_items(items)
+
+
+def search_hongguo_keyword(keyword: str, page: int) -> list[dict]:
+    """Use the official keyword endpoint; never replace an empty match with recommendations."""
+    if page > 1:
+        return []
+    try:
+        payload = fetch_json(
+            HONGGUO_SUGGESTION_API,
+            params={"app_id": "8662", "query": keyword, "count": 20},
+        )
+        return parse_hongguo_suggestion_items(payload)
+    except Exception as exc:
+        print(f"[search][hongguo-keyword] failed keyword={keyword} error={exc}")
+        return []
+
+
 def search_hongguo(keyword: str, page: int, category_filter: str) -> list[dict]:
+    if keyword:
+        return search_hongguo_keyword(keyword, page)
+
+    try:
+        payload = fetch_json(
+            HONGGUO_CATEGORY_API,
+            params=build_hongguo_api_params(keyword, page, category_filter),
+        )
+        if not payload.get("isSuccess"):
+            raise ValueError("Hongguo category API returned an unsuccessful response")
+        items = parse_hongguo_api_items(payload)
+        if items:
+            filtered = [x for x in items if matches_keywords(x, "", category_filter)]
+            return filtered if category_filter else items
+    except Exception as exc:
+        print(f"[search][hongguo-api] failed error={exc}")
+
+    # Compatibility fallback for older server-rendered versions of the website.
     urls = []
     query = first_category_query(keyword, category_filter)
-    urls.append(f"https://hongguoduanju.com/category?{query}")
-    urls.append("https://hongguoduanju.com/category?sort_type=1")
-    urls.append("https://hongguoduanju.com/")
+    urls.append(f"{HONGGUO_BASE_URL}/category?{query}")
+    urls.append(f"{HONGGUO_BASE_URL}/category?sort_type=1")
+    urls.append(f"{HONGGUO_BASE_URL}/")
 
     items = []
     for url in urls:
         try:
-            items.extend(parse_hongguo_cards(fetch_text(url), "https://hongguoduanju.com"))
+            items.extend(parse_hongguo_cards(fetch_text(url), HONGGUO_BASE_URL))
         except Exception as exc:
             print(f"[search][hongguo] failed url={url} error={exc}")
     items = dedupe_items(items)
-    filtered = [x for x in items if matches_keywords(x, keyword, category_filter)]
-    return apply_page(filtered or items, page)
+    filtered = [x for x in items if matches_keywords(x, "", category_filter)]
+    return apply_page(filtered if category_filter else items, page)
 
 
 def parse_generic_cards(html_text: str, base_url: str, source_name: str, keyword: str = "") -> list[dict]:
@@ -496,9 +965,20 @@ def api_search():
     try:
         items = search_short_drama(keyword, page, source, category_filter)
         message = f"搜索完成：{source}，第 {page} 页，返回 {len(items)} 条。"
-        return jsonify({"items": items, "page": page, "source": source, "message": message})
+        has_more = bool(items) and not bool(keyword)
+        return jsonify({"items": items, "page": page, "source": source, "has_more": has_more, "message": message})
     except Exception as exc:
         return jsonify({"items": [], "page": page, "source": source, "message": f"搜索失败：{exc}"}), 500
+
+
+@app.route("/api/dramas/<series_id>", methods=["GET"])
+def api_drama_detail(series_id: str):
+    try:
+        return jsonify({"item": fetch_hongguo_series_item(series_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": f"加载完整分集失败：{exc}"}), 502
 
 
 # ───────────────────────── 页面和下载 ─────────────────────────
@@ -531,17 +1011,81 @@ def _should_open_browser() -> bool:
     return os.getenv("OPEN_BROWSER", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _window_mode_enabled() -> bool:
+    """Built-in window is the default; set APP_WINDOW=0 to fall back to browser mode."""
+    if os.getenv("APP_WINDOW", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        import webview  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _wait_for_server(url: str, timeout: float = 15.0) -> bool:
+    import time
+    import urllib.request
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2):
+                return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
+def _run_with_window(port: int) -> None:
+    """Bind before opening a native window; never connect to an unrelated listener."""
+    import webview
+    # Native app uses an OS-assigned port (AirPlay often occupies 5000 on Mac).
+    server = make_server("127.0.0.1", port, app, threaded=True)
+    os.environ["APP_PORT"] = str(server.server_port)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="flask-server")
+    thread.start()
+    try:
+        webview.create_window(
+            "短剧下载神器", f"http://127.0.0.1:{server.server_port}",
+            width=1360, height=880, min_size=(960, 640), text_select=True,
+        )
+        webview.start()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("APP_PORT", "5000"))
+    if "--self-test" in sys.argv:
+        from smoke_test import run_bundled_checks
+        run_bundled_checks(parser_module)
+        sys.exit(0)
+    if "--ui-smoke-test" in sys.argv:
+        from smoke_test import run_ui_checks
+        run_ui_checks()
+        sys.exit(0)
+    window_mode = _window_mode_enabled()
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("APP_PORT", "0" if window_mode else "5055"))
     url = f"http://127.0.0.1:{port}"
+    os.environ["APP_PORT"] = str(port)
 
-    if _should_open_browser():
-        def open_browser():
-            import time
-            time.sleep(1)
-            webbrowser.open(url)
+    def initialize_device():
+        try:
+            ensure_default_device_config()
+        except Exception as exc:
+            print(f"默认设备配置生成失败，可在设置页重试：{exc}")
+    if os.getenv("AUTO_DEVICE_CONFIG", "1") != "0":
+        threading.Thread(target=initialize_device, daemon=True, name="device-setup").start()
 
-        threading.Thread(target=open_browser, daemon=True).start()
+    if window_mode:
+        _run_with_window(port)
+    else:
+        if _should_open_browser():
+            def open_browser():
+                import time
+                time.sleep(1)
+                webbrowser.open(url)
 
-    print(f"短剧下载工具 开源版: {url}")
-    app.run(host="127.0.0.1", port=port, debug=os.getenv("FLASK_DEBUG", "0") == "1")
+            threading.Thread(target=open_browser, daemon=True).start()
+
+        print(f"短剧下载工具 开源版: {url}")
+        app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
