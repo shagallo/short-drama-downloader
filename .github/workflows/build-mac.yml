@@ -1,0 +1,113 @@
+name: build-mac
+
+# 触发方式：推送到 main 分支自动构建；也可在 Actions 页手动 Run workflow
+# 产出：macOS .app + .dmg 安装镜像（Artifacts 中下载）
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'build/mac-*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        working-directory: 源码_开源版
+        run: python -m pip install -r requirements.txt pyinstaller pillow
+
+      - name: 平台回归测试
+        working-directory: 源码_开源版
+        env:
+          DUANJU_DATA_DIR: ${{ runner.temp }}/duanju-unit-tests
+        run: python -m unittest discover -s tests -v
+
+      - name: 生成 macOS 图标（icns）
+        working-directory: 源码_开源版
+        run: |
+          python tools_make_icon.py
+          mkdir -p icon.iconset
+          sips -z 16 16     static/assets/app_icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     static/assets/app_icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     static/assets/app_icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     static/assets/app_icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   static/assets/app_icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   static/assets/app_icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   static/assets/app_icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   static/assets/app_icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   static/assets/app_icon.png --out icon.iconset/icon_512x512.png
+          cp static/assets/app_icon.png icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o static/assets/app_icon.icns
+
+      - name: PyInstaller 构建 .app
+        working-directory: 源码_开源版
+        run: pyinstaller --clean --noconfirm 短剧下载神器开源版_mac.spec
+
+      - name: 冒烟测试（启动并验证接口）
+        working-directory: 源码_开源版
+        run: |
+          APP="./dist/短剧下载神器开源版.app/Contents/MacOS/短剧下载神器开源版"
+          "$APP" --self-test
+          test -f "$HOME/Library/Application Support/ShortDramaDownloader/self-test.json"
+          "$APP" --ui-smoke-test &
+          UI_PID=$!
+          for i in $(seq 1 30); do
+            if ! kill -0 "$UI_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 "$UI_PID" 2>/dev/null; then kill "$UI_PID"; echo "UI test timeout"; exit 1; fi
+          wait "$UI_PID"
+          test -f "$HOME/Library/Application Support/ShortDramaDownloader/ui-test.json"
+          AUTO_DEVICE_CONFIG=0 OPEN_BROWSER=0 APP_WINDOW=0 APP_PORT=5091 "$APP" &
+          APP_PID=$!
+          trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5091/api/downloads > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:5091/ > /dev/null
+          curl -sf http://127.0.0.1:5091/api/download-settings > "$RUNNER_TEMP/settings.json"
+          python -c 'import json,os; from pathlib import Path; d=json.load(open(os.environ["RUNNER_TEMP"]+"/settings.json")); assert d["writable"], d; assert Path(d["download_dir"]) == Path.home()/"Downloads"/"短剧下载神器", d'
+          curl -sf -X POST http://127.0.0.1:5091/api/download-folder/open > /dev/null
+          kill "$APP_PID" || true
+          if [ "$ok" != "1" ]; then echo "smoke test failed"; exit 1; fi
+          echo "smoke test passed"
+
+      - name: 制作 DMG 安装镜像
+        run: |
+          mkdir -p 安装包
+          mkdir -p dmg-root
+          cp -R "源码_开源版/dist/短剧下载神器开源版.app" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create \
+            -volname "短剧下载神器" \
+            -srcfolder dmg-root \
+            -ov -format UDZO \
+            "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg"
+          shasum -a 256 "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg" > 安装包/SHA256-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 短剧下载神器-mac-${{ matrix.arch }}
+          path: |
+            安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg
+            安装包/SHA256-${{ matrix.arch }}.txt
+          if-no-files-found: error
