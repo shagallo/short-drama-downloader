@@ -8,9 +8,13 @@ def _bytes_to_list(data):
 class SM3:
     """pysmx SM3 兼容包装 — 底层用 gmssl"""
     def __init__(self, data=b''):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         self._data = bytearray(data)
     
     def update(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         self._data.extend(data)
     
     def digest(self):
