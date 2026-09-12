@@ -4,6 +4,8 @@ name: build-mac
 # 产出：macOS .app + .dmg 安装镜像（Artifacts 中下载）
 on:
   workflow_dispatch:
+  push:
+    branches: [main, 'build/mac-*']
 
 permissions:
   contents: read
