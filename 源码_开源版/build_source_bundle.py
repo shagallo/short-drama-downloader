@@ -11,7 +11,8 @@ def main():
     destination.parent.mkdir(parents=True, exist_ok=True)
     files = [source / name for name in (
         "app.py", "1.py", "download_manager.py", "platform_support.py", "smoke_test.py",
-        "requirements.txt", "tools_make_icon.py", "README_MAC.md",
+        "requirements.txt", "tools_make_icon.py", "README.md", "README_MAC.md",
+        "LICENSE", "开源介绍.md",
         "短剧下载神器开源版_mac.spec", "build_source_bundle.py",
     )]
     files += [repo / ".github/workflows/build-mac.yml"]
