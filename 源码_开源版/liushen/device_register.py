@@ -107,8 +107,6 @@ def post_device_register(dev_info, extra):
 
     req_url = f"{url}?{urllib.parse.urlencode(params)}"
 
-    print(params)
-
     dev = {}
 
     gzip_post_data = get_post_data(dev_info)
@@ -132,13 +130,21 @@ def post_device_register(dev_info, extra):
         headers=headers,
         data=post_data,
         #proxies=proxys
+        timeout=30,
     )
 
-    print(response.text)
-
-    obj = json.loads(response.text)
-    dev_info['device']['deviceId'] = str(obj["device_id"])
-    dev_info['device']['iid'] = str(obj["install_id"])
+    response.raise_for_status()
+    try:
+        obj = response.json()
+    except ValueError as exc:
+        raise RuntimeError("设备注册接口返回了无法解析的数据") from exc
+    device_id = str(obj.get("device_id") or "").strip()
+    install_id = str(obj.get("install_id") or "").strip()
+    if not device_id or not install_id:
+        message = str(obj.get("message") or obj.get("status_msg") or "注册响应缺少设备参数")
+        raise RuntimeError(f"设备注册失败：{message}")
+    dev_info['device']['deviceId'] = device_id
+    dev_info['device']['iid'] = install_id
 
     time.sleep(2)
     if not response.cookies:
@@ -146,7 +152,6 @@ def post_device_register(dev_info, extra):
     else:
         cookies_dict = cookie_json(response)
         dev_info['extra']['cookies'] = json.loads(json.dumps(cookies_dict, indent=4))
-        print(dev_info['extra']['cookies'])
 
     return response
 
@@ -175,8 +180,9 @@ def send_app_alert_check(dev_info):
         sign_urls,
         headers=sign_headers,
         # proxies=proxies
+        timeout=30,
     )
-    print(response.text)
+    response.raise_for_status()
 
     obj = json.loads(response.text)
     if not response.cookies:
@@ -237,8 +243,27 @@ def device_register():
         # "device_id": "",
     }
 
-    post_device_register(dev_info,extra)
-    send_app_alert_check(dev_info)
+    post_device_register(dev_info, extra)
+    activation_warning = ""
+    try:
+        send_app_alert_check(dev_info)
+    except Exception as exc:
+        # Registration already succeeded. This follow-up check is best-effort and
+        # is not required by the video endpoint.
+        activation_warning = str(exc)
+    return {
+        "device_id": dev_info['device']['deviceId'],
+        "install_id": dev_info['device']['iid'],
+        "platform": "android",
+        "activation_warning": activation_warning,
+    }
 
 
-device_register()
+if __name__ == "__main__":
+    generated = device_register()
+    print(json.dumps({
+        "ok": True,
+        "device_id": generated["device_id"][:3] + "***" + generated["device_id"][-3:],
+        "install_id": generated["install_id"][:3] + "***" + generated["install_id"][-3:],
+        "platform": generated["platform"],
+    }, ensure_ascii=False))
