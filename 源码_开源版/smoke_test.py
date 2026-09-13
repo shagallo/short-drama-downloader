@@ -1,8 +1,10 @@
-"""Offline checks run inside the packaged macOS executable in CI."""
+"""Offline checks run inside packaged Windows and macOS executables in CI."""
 import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from platform_support import data_dir, default_download_dir, ensure_writable_directory
 
@@ -31,16 +33,40 @@ def run_bundled_checks(parser):
 
 def run_ui_checks():
     import webview
+    from werkzeug.serving import make_server
+    application = sys.modules['__main__'].app
+    # Keep this packaging check offline; exercise the real UI and local APIs.
+    application.view_functions['api_search'] = lambda: {"items": [], "total": 0}
+    server = make_server('127.0.0.1', 0, application, threaded=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     results = []
-    window = webview.create_window("Mac 兼容测试", html="<html><body>中文界面测试</body></html>")
+    window = webview.create_window("桌面兼容测试", url=f'http://127.0.0.1:{server.server_port}')
 
     def verify():
         try:
-            results.append(window.evaluate_js("document.body.textContent") == "中文界面测试")
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                ready = window.evaluate_js("""Boolean(
+                    document.querySelector('#downloadDir').value &&
+                    getComputedStyle(document.querySelector('.page')).display &&
+                    typeof bindEvents === 'function')""")
+                if ready:
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError('完整界面或下载设置未加载')
+            window.evaluate_js("document.querySelector('[data-page=downloads]').click()")
+            results.append(window.evaluate_js("document.querySelector('#downloadsPage').classList.contains('active')"))
+            window.evaluate_js("document.querySelector('[data-page=settings]').click()")
+            results.append(window.evaluate_js("document.querySelector('#settingsPage').classList.contains('active')"))
         finally:
             window.destroy()
 
     window.events.loaded += verify
-    webview.start()
-    assert results == [True], "原生 WebKit 窗口测试失败"
-    (data_dir() / "ui-test.json").write_text('{"ok": true}', encoding="utf-8")
+    try:
+        webview.start()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert results == [True, True], "完整桌面界面导航测试失败"
+    (data_dir() / "ui-test.json").write_text('{"ok": true, "full_ui": true, "navigation": true}', encoding="utf-8")
