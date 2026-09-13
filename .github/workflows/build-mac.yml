@@ -75,7 +75,7 @@ jobs:
       - name: 检查 Apple Silicon 架构和签名完整性
         run: |
           APP="源码_开源版/dist/短剧下载神器开源版.app"
-          lipo -verify_arch arm64 "$APP/Contents/MacOS/短剧下载神器开源版"
+          lipo "$APP/Contents/MacOS/短剧下载神器开源版" -verify_arch arm64
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: 冒烟测试（启动并验证接口）
