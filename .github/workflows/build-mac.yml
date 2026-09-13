@@ -72,6 +72,12 @@ jobs:
         working-directory: 源码_开源版
         run: pyinstaller --clean --noconfirm 短剧下载神器开源版_mac.spec
 
+      - name: 检查 Apple Silicon 架构和签名完整性
+        run: |
+          APP="源码_开源版/dist/短剧下载神器开源版.app"
+          lipo -verify_arch arm64 "$APP/Contents/MacOS/短剧下载神器开源版"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
       - name: 冒烟测试（启动并验证接口）
         working-directory: 源码_开源版
         run: |
@@ -80,7 +86,7 @@ jobs:
           test -f "$HOME/Library/Application Support/ShortDramaDownloader/self-test.json"
           "$APP" --ui-smoke-test &
           UI_PID=$!
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if ! kill -0 "$UI_PID" 2>/dev/null; then break; fi
             sleep 1
           done
@@ -115,6 +121,31 @@ jobs:
             -ov -format UDZO \
             "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg"
           shasum -a 256 "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg" > 安装包/SHA256-${{ matrix.arch }}.txt
+
+      - name: 验证最终 DMG 内的应用
+        run: |
+          MOUNT="$RUNNER_TEMP/duanju-dmg"
+          mkdir -p "$MOUNT"
+          hdiutil verify "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "安装包/短剧下载神器开源版_mac_v1.2.0_${{ matrix.arch }}.dmg"
+          trap 'hdiutil detach "$MOUNT"' EXIT
+          codesign --verify --deep --strict "$MOUNT/短剧下载神器开源版.app"
+          DUANJU_DATA_DIR="$RUNNER_TEMP/dmg-self-test" "$MOUNT/短剧下载神器开源版.app/Contents/MacOS/短剧下载神器开源版" --self-test
+          test -f "$RUNNER_TEMP/dmg-self-test/self-test.json"
+
+      - name: 保留验证报告
+        if: always()
+        run: |
+          mkdir -p 安装包/验证报告
+          cp "$HOME/Library/Application Support/ShortDramaDownloader/"*test.json 安装包/验证报告/ 2>/dev/null || true
+          python -m pip freeze > 安装包/验证报告/dependencies.txt
+          git rev-parse HEAD > 安装包/验证报告/commit.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-arm64-validation
+          path: 安装包/验证报告/
 
       - uses: actions/upload-artifact@v4
         with:
